@@ -93,6 +93,17 @@
   }
   .logout-btn:hover{border-color:var(--danger);color:var(--danger);}
 
+  .pending-sync-bar{
+    display:flex;align-items:center;justify-content:space-between;gap:10px;
+    background:rgba(255,193,7,0.12);border:1px solid #d4a017;border-radius:2px;
+    padding:9px 16px;margin-bottom:20px;font-size:12px;color:#e0b23a;
+  }
+  .sync-now-btn{
+    background:none;border:1px solid #d4a017;border-radius:2px;color:#e0b23a;
+    padding:5px 12px;font-size:11px;cursor:pointer;white-space:nowrap;
+  }
+  .sync-now-btn:hover{background:#d4a017;color:var(--navy-900);}
+
   .panel{
     background:var(--card);border:1px solid var(--line);border-radius:2px;
     padding:22px;margin-bottom:24px;position:relative;
@@ -418,6 +429,7 @@
 </head>
 <body>
 
+
 <!-- LOGIN SCREEN -->
 <div class="wrap login-screen" id="loginScreen">
   <div class="login-badge">
@@ -523,6 +535,11 @@
       Signed in as <b id="sessionName"></b><span class="role-chip" id="sessionRoleChip"></span>
     </div>
     <button class="logout-btn" id="logoutBtn">Log out</button>
+  </div>
+
+  <div class="pending-sync-bar hidden" id="pendingSyncBadge">
+    <span id="pendingSyncText">⏳ 0 visits waiting to sync</span>
+    <button type="button" class="sync-now-btn" id="syncNowBtn">Sync Now</button>
   </div>
 
   <div class="panel" id="modSettingsPanel" style="display:none;">
@@ -634,7 +651,7 @@
       </div>
       <button class="submit-btn" id="historyUploadBtn">Add Photo</button>
     </div>
-    <p class="hint" style="margin:0 0 10px;">Photos are visible to everyone from the "Falcons History" tab on the sign-in page. Keep images reasonably small (large photos may fail to save).</p>
+    <p class="hint" style="margin:0 0 10px;">Photos are visible to everyone from the "Falcons History" tab on the sign-in page. Every photo is automatically compressed to under 0.5MB before it's saved.</p>
     <h2 class="history-subhead">Ex Moderators</h2>
     <div class="history-gallery" id="historyGalleryManage-exmods"></div>
     <h2 class="history-subhead">First Winners Team</h2>
@@ -771,6 +788,12 @@
     <p class="hint" style="margin:0 0 12px;">Your team's answers only.</p>
     <div id="leaderCustomInsights"></div>
   </div>
+
+  <div class="panel">
+    <h2>Team Visits Timeline</h2>
+    <button type="button" class="dash-toggle-btn" id="leaderSortBtn">Sort: Newest first</button>
+    <div id="leaderVisitTimeline"></div>
+  </div>
 </div>
 
 <div class="modal-overlay hidden" id="memberDetailModal">
@@ -814,10 +837,30 @@ async function signInWithPassword(email, password){
     if(!res.ok) return { ok:false, error: data.error && data.error.message };
     authToken = data.idToken;
     currentUid = data.localId;
-    return { ok:true, uid: data.localId };
+    return { ok:true, uid: data.localId, idToken: data.idToken, refreshToken: data.refreshToken };
   }catch(e){
     console.error('Sign-in failed', e);
     return { ok:false, error: 'network' };
+  }
+}
+
+/* Exchanges a stored refreshToken for a new idToken without needing
+   the password again. Only works online — used both to keep a long
+   member session alive and to re-authenticate right before syncing
+   visits that were queued while offline. */
+async function refreshIdToken(refreshToken){
+  try{
+    const res = await fetch(`https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`
+    });
+    const data = await res.json();
+    if(!res.ok) return null;
+    return { idToken: data.id_token, refreshToken: data.refresh_token, uid: data.user_id };
+  }catch(e){
+    console.error('Token refresh failed', e);
+    return null;
   }
 }
 
@@ -901,6 +944,157 @@ function nameToEmail(name){
   return `${slugify(name)}@falcons.local`;
 }
 
+/* ---------- Offline support: local session + pending-visit queue ----------
+   Two separate things are cached in localStorage (device-only, never
+   synced anywhere itself):
+   1. The member's last signed-in session + refresh token, so the app
+      can log them back in automatically even with zero connectivity
+      (real Firebase sign-in requires a network call, which a fully
+      offline page load can't make).
+   2. Any visits saved while offline, queued here until a connection
+      is available, then flushed to Firebase automatically. */
+const MEMBER_SESSION_KEY = 'falcons-member-session';
+const PENDING_VISITS_KEY = 'falcons-pending-visits';
+
+function saveMemberSessionLocally(sessionData, idToken, refreshToken){
+  try{
+    localStorage.setItem(MEMBER_SESSION_KEY, JSON.stringify({ session: sessionData, idToken, refreshToken }));
+  }catch(e){ console.error('Could not persist session locally', e); }
+}
+
+function loadMemberSessionLocally(){
+  try{
+    const raw = localStorage.getItem(MEMBER_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ return null; }
+}
+
+function clearMemberSessionLocally(){
+  try{ localStorage.removeItem(MEMBER_SESSION_KEY); }catch(e){}
+}
+
+function getPendingVisits(){
+  try{
+    const raw = localStorage.getItem(PENDING_VISITS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  }catch(e){ return []; }
+}
+
+function savePendingVisits(list){
+  try{ localStorage.setItem(PENDING_VISITS_KEY, JSON.stringify(list)); }
+  catch(e){ console.error('Could not persist pending visits locally', e); }
+}
+
+function queueVisitOffline(visit){
+  const pending = getPendingVisits();
+  pending.push(visit);
+  savePendingVisits(pending);
+  updatePendingBadge();
+}
+
+function updatePendingBadge(){
+  const el = $('pendingSyncBadge');
+  if(!el) return;
+  const count = getPendingVisits().length;
+  if(count === 0){
+    el.classList.add('hidden');
+  }else{
+    el.classList.remove('hidden');
+    $('pendingSyncText').textContent = `⏳ ${count} visit${count===1?'':'s'} waiting to sync`;
+  }
+}
+
+let syncInFlight = false;
+
+/* Called on reconnect, on page load if already online, and after
+   every manual "Sync Now" tap. Refreshes the token first (idTokens
+   expire after ~1 hour, and a lot could've happened while offline),
+   then replays each queued visit through the normal save path. */
+async function flushPendingVisits(){
+  if(syncInFlight) return;
+  const pending = getPendingVisits();
+  if(pending.length === 0 || !navigator.onLine) return;
+
+  syncInFlight = true;
+  const saved = loadMemberSessionLocally();
+  if(saved && saved.refreshToken){
+    const refreshed = await refreshIdToken(saved.refreshToken);
+    if(refreshed){
+      authToken = refreshed.idToken;
+      currentUid = refreshed.uid;
+      saveMemberSessionLocally(saved.session, refreshed.idToken, refreshed.refreshToken);
+    }
+  }
+
+  const stillPending = [];
+  for(const visit of pending){
+    const ok = await saveOneVisit(visit);
+    if(ok){
+      bumpVisitSummary(visit.member, 1);
+    }else{
+      stillPending.push(visit);
+    }
+  }
+  savePendingVisits(stillPending);
+  updatePendingBadge();
+  syncInFlight = false;
+
+  if(stillPending.length === 0 && pending.length > 0){
+    showToast('All pending visits synced.');
+    if(session && session.role === 'member') loadVisits();
+  }
+}
+
+window.addEventListener('online', flushPendingVisits);
+
+$('syncNowBtn').onclick = () => {
+  if(!navigator.onLine){
+    showToast('Still no connection — will retry automatically once you\'re back online.');
+    return;
+  }
+  flushPendingVisits();
+};
+// Temporarily disabled — the offline "open the site with zero connectivity"
+// feature needs more testing before going back in. This actively removes
+// any earlier version of it that might still be stuck on a device.
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.getRegistrations().then(regs => {
+    regs.forEach(reg => reg.unregister());
+  });
+  if('caches' in window){
+    caches.keys().then(keys => keys.forEach(k => caches.delete(k)));
+  }
+}
+
+/* Runs once on page load, before anything else. If this device has a
+   member session saved from a previous successful (online) login, log
+   them straight back in from the cached data — no network call
+   required — so the app is usable even opening it with zero signal.
+   If we do have a connection, refresh the token in the background so
+   writes work immediately rather than waiting for the first failure. */
+async function tryRestoreMemberSession(){
+  const saved = loadMemberSessionLocally();
+  if(!saved || !saved.session) return false;
+
+  authToken = saved.idToken;
+  currentUid = saved.session.uid;
+  session = saved.session;
+
+  if(navigator.onLine && saved.refreshToken){
+    const refreshed = await refreshIdToken(saved.refreshToken);
+    if(refreshed){
+      authToken = refreshed.idToken;
+      currentUid = refreshed.uid;
+      saveMemberSessionLocally(session, refreshed.idToken, refreshed.refreshToken);
+    }
+  }
+
+  enterApp();
+  updatePendingBadge();
+  if(navigator.onLine) flushPendingVisits();
+  return true;
+}
+
 /* Public visit-count summary (falcons-visit-summary/{slug} = {name, total}).
    Kept separate from falcons-visit-log so the public Dashboard tab can
    read counts only, without exposing full visit details (contacts,
@@ -951,6 +1145,7 @@ async function populateMemberTeamSelect(){
 }
 
 populateMemberTeamSelect();
+tryRestoreMemberSession();
 
 /* ---------- Team Leaders (real Firebase accounts, scoped to one team) ---------- */
 function nameToLeaderEmail(name){
@@ -1043,6 +1238,7 @@ $('memberLoginBtn').onclick = async () => {
   const teamIdx = parseInt($('loginMemberTeam').value, 10) || 0;
   const teamNames = await getTeamNames();
   session = { role: 'member', name: (profile && profile.name) || name, team: (profile && profile.team) || teamNames[teamIdx], uid: result.uid };
+  saveMemberSessionLocally(session, result.idToken, result.refreshToken);
   $('loginMemberPassword').value = '';
   enterApp();
 };
@@ -1423,6 +1619,7 @@ renderCustomFieldsForm();
 $('logoutBtn').onclick = () => {
   session = null;
   signOutLocal();
+  clearMemberSessionLocally();
   $('mainApp').classList.add('hidden');
   $('loginScreen').classList.remove('hidden');
   $('loginMemberName').value = '';
@@ -1488,6 +1685,30 @@ function renderLeaderStats(){
   }
 
   renderLeaderCustomInsights(teamVisits);
+  renderLeaderVisitTimeline();
+}
+
+let leaderVisitSortDesc = true;
+
+$('leaderSortBtn').onclick = () => {
+  leaderVisitSortDesc = !leaderVisitSortDesc;
+  $('leaderSortBtn').textContent = leaderVisitSortDesc ? 'Sort: Newest first' : 'Sort: Oldest first';
+  renderLeaderVisitTimeline();
+};
+
+function renderLeaderVisitTimeline(){
+  const container = $('leaderVisitTimeline');
+  const teamVisits = visits.slice().sort((a,b) => {
+    const cmp = (a.loggedAt || '').localeCompare(b.loggedAt || '');
+    return leaderVisitSortDesc ? -cmp : cmp;
+  });
+
+  if(teamVisits.length === 0){
+    container.innerHTML = '<div class="history-empty">No visits logged for this team yet.</div>';
+    return;
+  }
+
+  container.innerHTML = teamVisits.map(v => renderVisitCard(v, '')).join('');
 }
 
 async function renderLeaderCustomInsights(teamVisits){
@@ -1552,6 +1773,7 @@ function enterApp(){
   $('filterMember').classList.toggle('hidden', session.role !== 'moderator');
   $('totalLabel').textContent = session.role === 'moderator' ? 'Total Visits (All)' : 'Your Visits';
   loadVisits();
+  updatePendingBadge();
   if(session.role === 'moderator'){
     loadHistoryGallery();
     renderTeamNameInputs();
@@ -1642,6 +1864,13 @@ async function loadVisits(){
     visits = result && typeof result === 'object'
       ? Object.values(result).sort((a,b) => (b.loggedAt || '').localeCompare(a.loggedAt || ''))
       : [];
+
+    // Visits queued while offline (this device, not yet synced) won't
+    // be in the server result above — merge them back in so they stay
+    // visible across reloads, not just for the rest of this session.
+    const pending = getPendingVisits().filter(v => v.member === session.name);
+    pending.forEach(v => { v._pending = true; });
+    visits = [...pending, ...visits.filter(v => !pending.some(p => p.id === v.id))];
   }
   renderAll();
 }
@@ -1666,16 +1895,23 @@ $('clearAllVisitsBtn').onclick = async () => {
   const typed = prompt('Type DELETE (in capitals) to confirm.');
   if(typed !== 'DELETE'){ showToast('Cancelled — no logs were deleted.'); return; }
 
-  // Deleted team-by-team (not at the falcons-visit-log root) so this
-  // reuses the exact same $teamKey-scoped write permission moderators
-  // already have via deleteOneVisit/saveOneVisit, instead of requiring
-  // a broader root-level write rule in Firebase.
-  const teamNames = await getTeamNames();
-  let allOk = true;
-  for(const teamName of teamNames){
-    const teamKey = encodeTeamKey(teamName);
-    const ok = await dbDelete(`falcons-visit-log/${teamKey}`);
-    if(!ok) allOk = false;
+  // Deleted at the falcons-visit-log root in one call — moderators have
+  // write access there per the Rules, and this also sweeps up any
+  // stray buckets (like visits saved before a team was assigned, or
+  // under a since-renamed team) that a per-team-name loop would miss.
+  let allOk = await dbDelete('falcons-visit-log');
+
+  // The public leaderboard reads from falcons-visit-summary, a separate
+  // per-member aggregate that bumpVisitSummary keeps in sync on every
+  // save/delete — but a bulk clear bypasses that, so it has to be reset
+  // here too, one $slug at a time (moderators only have write access
+  // at the $slug level per the Rules, not at the summary root).
+  const summary = await dbGet('falcons-visit-summary');
+  if(summary && typeof summary === 'object'){
+    for(const slug of Object.keys(summary)){
+      const ok = await dbDelete(`falcons-visit-summary/${slug}`);
+      if(!ok) allOk = false;
+    }
   }
 
   if(allOk){
@@ -1696,6 +1932,10 @@ $('saveBtn').onclick = async () => {
 
   if(!contact){
     showToast('Please fill in the name.');
+    return;
+  }
+  if(!session.team){
+    showToast('Your account has no team assigned — ask a moderator to fix this before logging visits.');
     return;
   }
   if(!geoCoords){
@@ -1724,13 +1964,21 @@ $('saveBtn').onclick = async () => {
     loggedAt: new Date().toISOString()
   };
 
-  const saved = await saveOneVisit(visit);
-  if(!saved){
-    showToast('Save failed — check your connection and try again.');
-    return;
+  const saved = navigator.onLine ? await saveOneVisit(visit) : false;
+  if(saved){
+    bumpVisitSummary(visit.member, 1);
+  }else{
+    // Either genuinely offline, or the request just failed while we
+    // thought we were online — queue it either way so nothing is lost.
+    // saveOneVisit's PUT is keyed by the visit's own id, so replaying
+    // it later on sync is always safe, never creates a duplicate.
+    queueVisitOffline(visit);
+    visit._pending = true;
+    showToast(navigator.onLine
+      ? 'Could not reach the server — visit saved on this device and will sync automatically.'
+      : 'No connection — visit saved on this device, will sync automatically once you\'re back online.');
   }
   visits.unshift(visit);
-  bumpVisitSummary(visit.member, 1);
 
   $('contactName').value = '';
   $('specialty').value = '';
@@ -1743,7 +1991,8 @@ $('saveBtn').onclick = async () => {
   setOrder('no');
   setHealthDay('no');
 
-  showToast('Visit saved.');
+  if(saved) showToast('Visit saved.');
+  updatePendingBadge();
   renderAll();
 };
 
@@ -1797,7 +2046,7 @@ function renderList(){
       <span class="tag ${v.type}">${v.type}</span>
       <div class="body-txt">
         <div class="name">${escapeHtml(v.contact)}</div>
-        <div class="meta">Visited by ${escapeHtml(v.member)}${v.specialty ? ' · ' + escapeHtml(v.specialty) : ''}${v.order === 'yes' ? ' · <span style="color:var(--accent);font-weight:600;">Order: Yes</span>' : ''}${v.healthDay === 'yes' ? ' · <span style="color:var(--gold);font-weight:600;">Health Day</span>' : ''}</div>
+        <div class="meta">Visited by ${escapeHtml(v.member)}${v.specialty ? ' · ' + escapeHtml(v.specialty) : ''}${v.order === 'yes' ? ' · <span style="color:var(--accent);font-weight:600;">Order: Yes</span>' : ''}${v.healthDay === 'yes' ? ' · <span style="color:var(--gold);font-weight:600;">Health Day</span>' : ''}${v._pending ? ' · <span style="color:#e0b23a;font-weight:600;">⏳ Pending sync</span>' : ''}</div>
         <div class="loc">📍 ${v.coords ? `<a href="${mapLink(v)}" target="_blank" rel="noopener">${locLabel(v)}</a>` : locLabel(v)}</div>
         ${v.notes ? `<div class="notes">"${escapeHtml(v.notes)}"</div>` : ''}
       </div>
@@ -1814,6 +2063,18 @@ function renderList(){
       if(!confirm('Delete this visit? This cannot be undone.')) return;
       const deleted = visits.find(v => v.id === btn.dataset.id);
       if(!deleted) return;
+
+      if(deleted._pending){
+        // Never made it to the server yet — just drop it from the
+        // local queue, no network call needed (and none would find
+        // anything to delete anyway).
+        savePendingVisits(getPendingVisits().filter(v => v.id !== deleted.id));
+        updatePendingBadge();
+        visits = visits.filter(v => v.id !== btn.dataset.id);
+        renderAll();
+        return;
+      }
+
       const ok = await deleteOneVisit(deleted.team, deleted.id);
       if(ok){
         visits = visits.filter(v => v.id !== btn.dataset.id);
@@ -2247,7 +2508,12 @@ const HISTORY_CATEGORIES = ['exmods', 'winners'];
 
 async function getHistoryPhotos(){
   const result = await dbGet('falcons-history');
-  return result && typeof result === 'object' ? Object.values(result) : [];
+  if(!result || typeof result !== 'object') return [];
+  // Use the real database key as the id, so photos saved under the
+  // old array-based format (before per-photo keys) can still be
+  // edited/deleted correctly even if their stored "id" field doesn't
+  // match their actual location.
+  return Object.entries(result).map(([key, val]) => ({ ...val, id: key }));
 }
 
 async function saveOnePhoto(photo){
@@ -2304,36 +2570,98 @@ function renderHistoryGallery(targetId, photos, editable){
   }
 }
 
+/* ---------- Compress an image file down to a target size before upload ---------- */
+function compressImageToDataUrl(file, targetBytes){
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+
+      let width = img.naturalWidth;
+      let height = img.naturalHeight;
+      const maxDim = 1600;
+      if(width > maxDim || height > maxDim){
+        const scale = maxDim / Math.max(width, height);
+        width = Math.round(width * scale);
+        height = Math.round(height * scale);
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+
+      // Step down quality (and, if needed, dimensions) until the
+      // resulting base64 string fits under targetBytes.
+      let quality = 0.85;
+      const attempt = () => {
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        if(dataUrl.length <= targetBytes || (quality <= 0.4 && width <= 640)){
+          resolve(dataUrl);
+          return;
+        }
+        if(quality > 0.4){
+          quality -= 0.1;
+        }else{
+          width = Math.round(width * 0.8);
+          height = Math.round(height * 0.8);
+          canvas.width = width;
+          canvas.height = height;
+          ctx.drawImage(img, 0, 0, width, height);
+          quality = 0.7;
+        }
+        setTimeout(attempt, 0);
+      };
+      attempt();
+    };
+
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Could not read image'));
+    };
+
+    img.src = objectUrl;
+  });
+}
+
 $('historyUploadBtn').onclick = async () => {
   const fileInput = $('historyFileInput');
   const caption = $('historyCaption').value.trim();
   const category = $('historyCategory').value;
   const file = fileInput.files[0];
   if(!file){ showToast('Choose a photo first.'); return; }
-  if(file.size > 1.5 * 1024 * 1024){
-    showToast('Photo too large — please use one under ~1.5MB.');
+  if(!file.type.startsWith('image/')){
+    showToast('Please choose an image file.');
     return;
   }
 
-  const reader = new FileReader();
-  reader.onload = async () => {
-    const photo = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2,6),
-      dataUrl: reader.result,
-      caption,
-      category,
-      addedBy: session.name,
-      date: new Date().toISOString().slice(0,10)
-    };
-    const ok = await saveOnePhoto(photo);
-    if(ok){
-      fileInput.value = '';
-      $('historyCaption').value = '';
-      showToast('Photo added to Falcons History.');
-      loadHistoryGallery();
-    }
+  showToast('Compressing photo…');
+  let dataUrl;
+  try{
+    dataUrl = await compressImageToDataUrl(file, 0.5 * 1024 * 1024);
+  }catch(e){
+    showToast('Could not process that photo — try a different file.');
+    return;
+  }
+
+  const photo = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2,6),
+    dataUrl,
+    caption,
+    category,
+    addedBy: session.name,
+    date: new Date().toISOString().slice(0,10)
   };
-  reader.readAsDataURL(file);
+  const ok = await saveOnePhoto(photo);
+  if(ok){
+    fileInput.value = '';
+    $('historyCaption').value = '';
+    showToast('Photo added to Falcons History.');
+    loadHistoryGallery();
+  }
 };
 </script>
 </body>
